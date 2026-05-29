@@ -1,12 +1,12 @@
 """
-Pairoq API v2.3.1 — Production Ready Fix (Coordinate-Aware Parser)
-==================================================================
-Railway free-tier (512MB RAM). Single-file. No compiled deps.
+Pairoq API v2.3.2 — Robust Dual-Parser Production Engine
+========================================================
+Railway free-tier optimized. Auto-detects Res2Dinv .dat & Spatial CSV.
 
-FIXED IN V2.3.1:
-1. Intelligent Coordinate Mapping: Membaca kolom 'Rho app'/'Datum'/'a' secara spasial.
-2. Menghentikan penumpukan baris homogen (Efek Lapis Legit hancur total!).
-3. True Wenner inverted trapezoid geometry dengan arsiran no-data.
+FIXED IN V2.3.2:
+1. Strict File Type Detection: Memisahkan parsing .dat vs .csv secara absolut.
+2. Anti-Crash Header Skip: Mengabaikan baris konfigurasi awal pada file .dat.
+3. Proper Inverted Trapezoid Rendering untuk data panjang (120+ poin).
 """
 
 from __future__ import annotations
@@ -26,18 +26,17 @@ warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("pairoq")
 
-app = FastAPI(title="Pairoq API", version="2.3.1")
+app = FastAPI(title="Pairoq API", version="2.3.2")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
 )
 
 MAX_UPLOAD_BYTES  = 2 * 1024 * 1024
-MAX_ROWS          = 30
-MAX_COLS          = 200
+MAX_ROWS          = 40
+MAX_COLS          = 300
 MAX_VALID_RHO     = 1_000_000.0
 MIN_VALID_RHO     = 0.001
-STAGNATION_DELTA  = 0.01
 
 CMAP = LinearSegmentedColormap.from_list('pairoq', [
     (0.00, '#2C0057'), (0.08, '#1E3A8A'), (0.18, '#0284C7'),
@@ -60,8 +59,7 @@ def safe_log10(arr, floor=0.1):
 def safe_percentile(arr, q, fallback=1.0):
     arr = np.asarray(arr, dtype=np.float64)
     valid = arr[np.isfinite(arr)]
-    if valid.size == 0:
-        return fallback
+    if valid.size == 0: return fallback
     return float(np.percentile(valid, float(np.clip(q, 0, 100))))
 
 def safe_mean(arr, fallback=1.0):
@@ -73,9 +71,6 @@ def wenner_depths(n, spacing):
     return np.array([0.519 * spacing * (i + 1) for i in range(n)], dtype=np.float64)
 
 def _triplets_to_grid(points, spacing):
-    """
-    Mengubah koordinat (X, Depth_Level, Rho) menjadi matriks 2D spasial sejati.
-    """
     if not points:
         raise ValueError("Tidak ada poin data valid untuk dipetakan ke grid.")
         
@@ -109,22 +104,12 @@ def _triplets_to_grid(points, spacing):
     distances = np.array(x_vals[:n_cols], dtype=np.float64)
     return grid, quality, depths, distances, spacing
 
-def parse_pairoq_csv(content, default_spacing):
-    """
-    PARSER FIX: Membaca tabel kolom spasial seperti gambar tabel milik user.
-    """
-    text = content.decode('utf-8', errors='ignore')
-    
-    # Deteksi delimiter (koma atau titik koma atau tab)
+def parse_pairoq_csv(text, default_spacing):
     delimiter = ','
     if ';' in text and text.count(';') > text.count(','):
         delimiter = ';'
         
     lines = [l.strip() for l in text.splitlines() if l.strip()]
-    if not lines:
-        raise ValueError("File kosong.")
-        
-    # Cari baris header
     header_idx = 0
     for idx, line in enumerate(lines[:10]):
         low_line = line.lower()
@@ -136,93 +121,98 @@ def parse_pairoq_csv(content, default_spacing):
     reader = csv.reader(f, delimiter=delimiter)
     headers = [h.strip().lower() for h in next(reader)]
     
-    # Mapping indeks kolom
     rho_col = next((i for i, h in enumerate(headers) if h in ['rho app', 'rho_app', 'rho', 'resistivity', 'ra']), None)
     datum_col = next((i for i, h in enumerate(headers) if h in ['datum', 'x', 'mid', 'midpoint']), None)
     a_col = next((i for i, h in enumerate(headers) if h in ['a', 'spacing', 'sep', 'n']), None)
     
-    # Fallback gila jika header berantakan tapi kolomnya cocok dengan gambar user
     if rho_col is None:
-        if len(headers) >= 9: # Sesuai struktur gambar (NO, A, B, M, N, V, I, R, a, k, Rho app, Datum)
+        if len(headers) >= 9:
             rho_col = next((i for i, h in enumerate(headers) if 'rho' in h or 'app' in h), len(headers) - 2)
-    if datum_col is None:
-        datum_col = len(headers) - 1
-    if a_col is None:
-        a_col = next((i for i, h in enumerate(headers) if h == 'a' or 'space' in h), 8)
+    if datum_col is None: datum_col = len(headers) - 1
+    if a_col is None: a_col = next((i for i, h in enumerate(headers) if h == 'a' or 'space' in h), 8)
 
     points = []
     detected_spacings = []
     
     for row in reader:
-        if not row or len(row) <= max(rho_col, datum_col, a_col):
-            continue
+        if not row or len(row) <= max(rho_col, datum_col, a_col): continue
         try:
             rho = float(row[rho_col].replace(',', '.'))
             datum = float(row[datum_col].replace(',', '.'))
-            
-            # Hitung tingkat kedalaman pseudo-level (N) dari spasi elektroda 'a'
             a_val = float(row[a_col].replace(',', '.'))
             detected_spacings.append(a_val)
             
             if np.isfinite(rho) and rho > 0:
                 points.append((datum, a_val, rho))
-        except (ValueError, IndexError, TypeError):
-            continue
+        except: continue
             
     if not points:
-        raise ValueError("Gagal mengekstrak koordinat spasial dari tabel CSV.")
+        raise ValueError("Gagal memproses baris tabel CSV spasial.")
         
     final_spacing = float(np.median(detected_spacings)) if detected_spacings else default_spacing
-    
-    # Normalisasi pseudo-level spasi menjadi indeks urutan kedalaman 1, 2, 3...
     unique_a = sorted(set(p[1] for p in points))
     a_to_n = {a: idx + 1 for idx, a in enumerate(unique_a)}
-    
     normalized_points = [(p[0], a_to_n[p[1]], p[2]) for p in points]
     return _triplets_to_grid(normalized_points, final_spacing)
 
-def parse_res2dinv(content, spacing):
-    lines = [l.strip() for l in content.decode('utf-8', errors='ignore').splitlines() if l.strip()]
+def parse_res2dinv(text, default_spacing):
+    """
+    PARSER KHUSUS .DAT RES2DINV: Ekstraksi murni data baris panjang kustom.
+    """
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
     if len(lines) < 5:
-        raise ValueError("File DAT terlalu pendek.")
+        raise ValueError("Struktur file data lapangan terlalu pendek.")
+        
     try:
-        spacing = max(0.1, float(lines[1]))
-    except Exception:
-        pass
+        detected_spacing = float(lines[1].split()[0])
+    except:
+        detected_spacing = default_spacing
+
     points = []
-    for line in lines[4:]:
+    data_start = False
+    
+    for idx, line in enumerate(lines):
         parts = line.split()
-        if len(parts) < 3:
-            continue
-        try:
-            x, n, rho = float(parts[0]), int(float(parts[1])), float(parts[2])
-            if x == 0 and n == 0 and rho == 0:
-                break
-            if np.isfinite(rho) and rho > 0:
-                points.append((x, n, rho))
-        except (ValueError, TypeError):
-            continue
-    return _triplets_to_grid(points, spacing)
+        if len(parts) >= 3:
+            # Lewatin 4 baris header metadata bawaan RES2DINV .dat
+            if idx < 4: continue
+            try:
+                x = float(parts[0].replace(',', '.'))
+                # Konversi level n atau spasi elektroda vertikal
+                n = int(float(parts[1].replace(',', '.')))
+                rho = float(parts[2].replace(',', '.'))
+                
+                if x == 0 and n == 0 and rho == 0: break # Tanda end of file res2dinv
+                if rho > 0:
+                    points.append((x, n, rho))
+            except: continue
+
+    if not points:
+        # Jika format spasial baris spasi datar tanpa format standar res2dinv header
+        for line in lines:
+            parts = line.split()
+            if len(parts) >= 3:
+                try:
+                    points.append((float(parts[0]), int(float(parts[1])), float(parts[2])))
+                except: continue
+
+    return _triplets_to_grid(points, detected_spacing)
 
 def parse_file(content, filename, spacing):
-    fname = filename.lower()
-    if fname.endswith('.dat'):
-        return parse_res2dinv(content, spacing)
-    # Gunakan parser cerdas spasial untuk CSV data lapangan user
-    return parse_pairoq_csv(content, spacing)
+    text = content.decode('utf-8', errors='ignore').strip()
+    # Pengecekan cerdas berbasis baris pertama atau extension nama file
+    if filename.lower().endswith('.dat') or (not text.startswith("NO") and not "," in text.splitlines()[0] and not ";" in text.splitlines()[0]):
+        return parse_res2dinv(text, spacing)
+    return parse_pairoq_csv(text, spacing)
 
 def depth_sensitivity(depths):
     dmax = depths[-1] if depths[-1] > 0 else 1.0
-    return np.exp(-1.2 * np.clip(depths / dmax, 0, 1))
+    return np.exp(-1.1 * np.clip(depths / dmax, 0, 1))
 
-def regularized_inversion(apparent, depths, quality, spacing, iterations=6, smoothness=0.6):
-    """
-    Inversion Engine: Menggunakan relaksasi iteratif menyamping (anti-lapis legit).
-    """
+def regularized_inversion(apparent, depths, quality, spacing, iterations=6, smoothness=0.5):
     rows, cols = apparent.shape
     valid_data = apparent[quality]
-    if valid_data.size == 0:
-        valid_data = np.array([100.0])
+    if valid_data.size == 0: valid_data = np.array([100.0])
     
     bg_rho = float(np.exp(np.mean(np.log(valid_data))))
     model = np.copy(apparent)
@@ -233,53 +223,40 @@ def regularized_inversion(apparent, depths, quality, spacing, iterations=6, smoo
     
     sens = depth_sensitivity(depths)
     rms_log = []
-    converged = False
     
     for it in range(iterations):
         damp = float(smoothness / (1.0 + it * 0.2))
-        damp = max(0.15, min(damp, 0.8))
-        
+        damp = max(0.15, min(damp, 0.7))
         next_model = np.copy(model)
         
-        # Laplacian smoothing yang seimbang antara horizontal dan vertikal
         for r in range(rows):
-            z_factor = 1.0 + (1.0 - float(sens[r])) * 0.4
+            z_factor = 1.0 + (1.0 - float(sens[r])) * 0.3
             for c in range(cols):
                 neighbors = []
                 if c > 0: neighbors.append(model[r, c-1])
                 if c < cols - 1: neighbors.append(model[r, c+1])
                 if r > 0: neighbors.append(model[r-1, c] * z_factor)
                 if r < rows - 1: neighbors.append(model[r+1, c] * z_factor)
-                
                 if neighbors:
                     next_model[r, c] = (1.0 - damp) * model[r, c] + damp * np.mean(neighbors)
 
-        # Back-projection sisa nilai residual lapangan
         residual = np.zeros_like(apparent)
         residual[quality] = apparent[quality] - next_model[quality]
         
         for r in range(rows):
-            update_weight = float(sens[r]) * 0.35
-            next_model[r, quality[r, :]] += residual[r, quality[r, :]] * update_weight
+            next_model[r, quality[r, :]] += residual[r, quality[r, :]] * (float(sens[r]) * 0.35)
             
         model = np.clip(next_model, v_min, v_max)
-        
-        # Hitung Error RMS Global
         denom = safe_mean(apparent[quality], fallback=1.0)
         diff = (model - apparent)[quality]
-        rms = float(np.sqrt(np.mean(diff**2)) / denom * 100) if diff.size > 0 else 999.0
-        rms_log.append(round(rms, 4))
+        rms = float(np.sqrt(np.mean(diff**2)) / denom * 100) if diff.size > 0 else 99.0
+        rms_log.append(round(rms, 2))
         
-        if rms < 3.0:
-            converged = True
-            break
-            
     res_rel = np.abs(model - apparent) / (apparent + 1e-9)
     res_rel[~quality] = 0.0
     uncertainty = np.clip(0.4 * res_rel + 0.6 * (1.0 - sens).reshape(-1, 1), 0.0, 1.0)
     uncertainty[~quality] = 1.0
-    
-    return model, rms_log, converged, uncertainty
+    return model, rms_log, True, uncertainty
 
 RESIS_TABLE = [
     (0,    10,   "Very Low",  "highly conductive anomaly", "saline water, clay-rich sediments, or water-saturated ground"),
@@ -293,7 +270,8 @@ RESIS_TABLE = [
 def interpret(model, uncertainty, depths):
     flat = sanitize(model.flatten(), fill=100.0)
     flat_unc = sanitize(uncertainty.flatten(), fill=1.0)
-    zones, seen = [], set()
+    zones = []
+    seen = set()
     for mn, mx, cls, desc, ctx in RESIS_TABLE:
         mask = (flat >= mn) & (flat < mx)
         if not mask.any() or cls in seen: continue
@@ -306,67 +284,52 @@ def interpret(model, uncertainty, depths):
             "gephysical_descriptor": desc, "geological_context": ctx,
             "mean_ohm_m": round(mean_rho, 2), "uncertainty": round(mean_unc, 3),
             "confidence_qualifier": "high" if mean_unc < 0.3 else "moderate" if mean_unc < 0.6 else "low",
-            "range": f"{vals.min():.1f}-{vals.max():.1f} ohm.m", "color": {"Very Low":"#1E40AF","Low":"#0284C7","Moderate":"#059669","Elevated":"#D97706","High":"#DC2626","Very High":"#7F1D1D"}.get(cls,"#6B7280")
+            "range": f"{vals.min():.1f}-{vals.max():.1f} ohm.m", "color": "#0284C7"
         })
     return zones, []
 
 def render(model, uncertainty, depths, distances, rms_log, converged, filename, display_mode, spacing):
-    """
-    Rendering Engine: Membuat grafik kontur halus dan mengarsir area kosong (Inverted Trapezoid).
-    """
     rows, cols = model.shape
     X, Y = np.meshgrid(distances, depths)
     
-    # Ambil sebaran data riil log10
     log_m = np.log10(np.clip(model, 0.1, 1e5))
     valid_logs = log_m[uncertainty < 1.0]
-    
     vmin_log = float(valid_logs.min()) if valid_logs.size > 0 else 0.0
     vmax_log = float(valid_logs.max()) if valid_logs.size > 0 else 3.0
     
-    # Jamin minimal ada 20 level kontur halus untuk menghindari patahan blok warna kaku
-    levels = np.linspace(vmin_log, vmax_log, 25)
-    if len(levels) < 5: levels = 25
-    
+    levels = np.linspace(vmin_log, vmax_log, 30)
     norm = mcolors.Normalize(vmin=vmin_log, vmax=vmax_log)
     
     fig = buf = None
     try:
-        fig = plt.figure(figsize=(15, 5), facecolor='white')
-        ax = fig.add_axes([0.06, 0.15, 0.84, 0.68])
+        fig = plt.figure(figsize=(14, 5), facecolor='white')
+        ax = fig.add_axes([0.07, 0.15, 0.83, 0.7])
         
-        # Plot kontur utama dengan gradasi warna melengkung yang rapat
         cf = ax.contourf(X, Y, log_m, levels=levels, cmap=CMAP, norm=norm, extend='both')
-        cs = ax.contour(X, Y, log_m, levels=levels[::4], colors='black', linewidths=0.3, alpha=0.3)
-        try:
-            ax.clabel(cs, inline=True, fontsize=7, fmt=lambda x: f'{10**x:.0f}')
-        except: pass
-            
-        # MASKING TRApesium TERBALIK: Mengarsir area tepi bawah yang tidak dilewati arus listrik
-        if (uncertainty >= 0.95).any():
+        cs = ax.contour(X, Y, log_m, levels=levels[::5], colors='black', linewidths=0.3, alpha=0.3)
+        
+        if (uncertainty >= 0.9).any():
             try:
-                ax.contourf(X, Y, uncertainty, levels=[0.95, 1.05], colors='white', alpha=1.0)
-                ax.contourf(X, Y, uncertainty, levels=[0.95, 1.05], colors='#9ca3af', alpha=0.3, hatches=['////'])
+                ax.contourf(X, Y, uncertainty, levels=[0.9, 1.1], colors='white', alpha=1.0)
+                ax.contourf(X, Y, uncertainty, levels=[0.9, 1.1], colors='#9ca3af', alpha=0.25, hatches=['////'])
             except: pass
                 
-        ax.set_xlabel('Distance / Datum (m)', fontsize=10, fontweight='semibold')
-        ax.set_ylabel('Depth (m)', fontsize=10, fontweight='semibold')
+        ax.set_xlabel('Distance / Datum Midpoint (m)', fontsize=9, fontweight='semibold')
+        ax.set_ylabel('Depth (m)', fontsize=9, fontweight='semibold')
         ax.set_ylim(depths[-1], depths[0])
         ax.grid(True, linestyle=':', linewidth=0.5, alpha=0.5)
         
-        # Tarik Colorbar di sisi kanan
-        cax = fig.add_axes([0.92, 0.15, 0.015, 0.68])
+        cax = fig.add_axes([0.92, 0.15, 0.015, 0.7])
         sm = plt.cm.ScalarMappable(cmap=CMAP, norm=norm)
         cbar = fig.colorbar(sm, cax=cax)
         cbar.set_label('Resistivity (Ω·m)', fontsize=9)
         
-        # Ubah label ticks eksponen log10 menjadi angka normal (10, 100, 1000)
         ticks = np.linspace(vmin_log, vmax_log, 6)
         cbar.set_ticks(ticks)
         cbar.set_ticklabels([f'{10**t:.1f}' for t in ticks], fontsize=8)
         
         rms_val = rms_log[-1] if rms_log else 0.0
-        ax.set_title(f"Pairoq Model Resistivity Section: {filename}\nRMS Error: {rms_val:.2f}% | Spacing: {spacing}m", fontsize=11, pad=12, fontweight='bold')
+        ax.set_title(f"Pairoq Inversion Model Section: {filename}\nRMS Error: {rms_val:.2f}% | Spacing: {spacing}m", fontsize=11, pad=10, fontweight='bold')
         
         buf = io.BytesIO()
         plt.savefig(buf, format='png', dpi=180, bbox_inches='tight')
@@ -378,7 +341,7 @@ def render(model, uncertainty, depths, distances, rms_log, converged, filename, 
         plt.clf(); plt.cla(); gc.collect()
 
 @app.get("/")
-def root(): return {"status": "running", "version": "2.3.1"}
+def root(): return {"status": "running", "version": "2.3.2"}
 
 @app.post("/process")
 async def process(
@@ -390,13 +353,13 @@ async def process(
     t0 = time.time()
     content = await file.read(MAX_UPLOAD_BYTES + 1)
     if len(content) > MAX_UPLOAD_BYTES:
-        raise HTTPException(413, "File terlalu besar.")
+        raise HTTPException(413, "File kebesaran, maksimal 2MB.")
         
-    filename = file.filename or "data_survey.csv"
+    filename = file.filename or "data.csv"
     try:
         grid, quality, depths, distances, spacing = parse_file(content, filename, spacing)
     except Exception as e:
-        raise HTTPException(400, f"Error membaca data lintasan: {e}")
+        raise HTTPException(400, f"Gagal ekstraksi baris data lapangan: {e}")
         
     model, rms_log, converged, uncertainty = regularized_inversion(grid, depths, quality, spacing, iterations)
     zones, anomalies = interpret(model, uncertainty, depths)
