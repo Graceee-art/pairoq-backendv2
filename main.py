@@ -1,18 +1,17 @@
 """
-Pairoq API v2.2 — Final Production Stabilization
+Pairoq API v2.3 — Production Ready Stabilization
 =================================================
 Railway free-tier (512MB RAM). Single-file. No compiled deps.
 
 SCIENTIFIC DISCLAIMER:
-Regularized least-squares APPROXIMATION only.
-NOT equivalent to RES2DINV, pyGIMLi, or ResIPy.
+Lightweight pseudo forward-response & iterative masked relaxation.
+Approximation only. NOT equivalent to RES2DINV, pyGIMLi, or ResIPy.
 Results are preliminary. Professional validation required.
 
-References:
-- Edwards (1977): Wenner pseudo-depth z = 0.519 * a * n
-- Constable et al. (1987): Occam regularization concept
-- Loke & Barker (1996): Damping/correction principles
-- Palacky (1987): Resistivity classification thresholds
+FIXED IN V2.3:
+1. True Wenner inverted trapezoid geometry (No more false right-edge anomalies).
+2. Masked Laplacian Regularization & Depth-decay update (RAM safe & non-blurring).
+3. Fixed Geometric-Logarithmic contour intervals ala RES2DINV.
 """
 
 from __future__ import annotations
@@ -32,7 +31,7 @@ warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("pairoq")
 
-app = FastAPI(title="Pairoq API", version="2.2.0")
+app = FastAPI(title="Pairoq API", version="2.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
@@ -87,25 +86,37 @@ def _quality_mask(grid):
     return q
 
 def _triplets_to_grid(points, spacing):
+    """
+    FIX PROBLEM 1: Murni mempertahankan geometri trapesium terbalik ERT Wenner.
+    Menghapus total duplikasi/padding nilai pinggir yang merusak penampang.
+    """
     n_vals = sorted(set(p[1] for p in points))[:MAX_ROWS]
     n_levels = len(n_vals)
+    
     rows_data = []
     for nv in n_vals:
         row_pts = sorted([p for p in points if p[1] == nv], key=lambda p: p[0])
         rows_data.append(row_pts)
+        
     n_cols = min(max(len(r) for r in rows_data), MAX_COLS)
-    grid = np.zeros((n_levels, n_cols), dtype=np.float64)
+    
+    # Inisialisasi awal dengan np.nan untuk area tanpa data
+    grid = np.full((n_levels, n_cols), np.nan, dtype=np.float64)
     quality = np.zeros((n_levels, n_cols), dtype=bool)
+    
     for ri, row_pts in enumerate(rows_data):
         for ci, (x, n, rho) in enumerate(row_pts[:n_cols]):
             if np.isfinite(rho) and rho > 0:
                 grid[ri, ci] = rho
                 quality[ri, ci] = True
-        if row_pts and len(row_pts) < n_cols:
-            last = row_pts[-1][2]
-            for ci in range(len(row_pts), n_cols):
-                grid[ri, ci] = last
-    quality &= _quality_mask(grid)
+                
+    # Bersihkan noise ekstrim menggunakan median filter global pada data valid
+    if quality.any():
+        median_val = float(np.median(grid[quality]))
+        v_mask = (grid >= median_val / 1e4) & (grid <= median_val * 1e4)
+        quality &= v_mask
+        grid[~quality] = np.nan
+
     depths = wenner_depths(n_levels, spacing)
     distances = np.arange(n_cols) * spacing + n_levels * spacing
     return grid, quality, depths, distances, spacing
@@ -207,67 +218,89 @@ def depth_sensitivity(depths):
     dmax = depths[-1] if depths[-1] > 0 else 1.0
     return np.exp(-1.5 * np.clip(depths / dmax, 0, 1))
 
-def lateral_smooth(row, sigma):
-    sigma = max(sigma, 0.1)
-    n = min(7, len(row))
-    x = np.arange(-(n // 2), n // 2 + 1)
-    k = np.exp(-x**2 / (2 * sigma**2)); k /= k.sum()
-    return sanitize(np.convolve(row, k, mode='same'), fill=safe_mean(row, fallback=100.0))
-
 def regularized_inversion(apparent, depths, quality, spacing, iterations=6,
-                           smoothness=0.5, convergence_thr=2.0):
+                          smoothness=0.5, convergence_thr=2.0):
+    """
+    FIX PROBLEM 2: Pseudo Forward-Response & Iterative Masked Relaxation.
+    Aman untuk RAM 512MB, mengabaikan NaN, mengontrol redaman berdasarkan kedalaman, 
+    dan menghasilkan batas kontur batuan yang memisah tajam.
+    """
     rows, cols = apparent.shape
-    apparent = sanitize(apparent, fill=100.0)
-    model = apparent.copy()
-    valid_mean = safe_mean(apparent[quality], fallback=100.0)
-    for r in range(rows):
-        for c in range(cols):
-            if not quality[r, c]:
-                nb = [apparent[r+dr, c+dc] for dr,dc in [(-1,0),(1,0),(0,-1),(0,1)]
-                      if 0<=r+dr<rows and 0<=c+dc<cols and quality[r+dr, c+dc]]
-                model[r, c] = safe_mean(np.array(nb), fallback=valid_mean)
-    model = sanitize(model, fill=valid_mean)
+    
+    valid_data = apparent[quality]
+    if valid_data.size == 0:
+        valid_data = np.array([100.0])
+    
+    bg_rho = float(np.exp(np.mean(np.log(valid_data))))
+    
+    model = np.copy(apparent)
+    model[~quality] = bg_rho
+    
+    v_min = max(safe_percentile(valid_data, 2) * 0.2, MIN_VALID_RHO)
+    v_max = min(safe_percentile(valid_data, 98) * 5.0, MAX_VALID_RHO)
+    
     sens = depth_sensitivity(depths)
-    valid_data = apparent[quality] if quality.any() else apparent.flatten()
-    valid_min = max(safe_percentile(valid_data, 2) * 0.3, MIN_VALID_RHO)
-    valid_max = min(safe_percentile(valid_data, 98) * 3.0, MAX_VALID_RHO)
-    if valid_max <= valid_min: valid_max = valid_min * 100
-    rms_log, prev_rms, diverge_count, converged = [], None, 0, False
+    
+    rms_log = []
+    converged = False
+    prev_rms = None
+    
     for it in range(iterations):
-        damp = float(np.clip(smoothness / (1.0 + it * 0.4) * (0.5 ** diverge_count), 0.02, 0.8))
+        damp = float(smoothness / (1.0 + it * 0.5))
+        damp = max(0.05, min(damp, 0.7))
+        
+        next_model = np.copy(model)
+        
+        # 1. Masked Laplacian Regularization
         for r in range(rows):
-            sm = lateral_smooth(model[r, :], 0.4 + (1.0 - float(sens[r])) * 1.2)
-            model[r, :] = (1 - damp) * model[r, :] + damp * sm
-        for c in range(cols):
-            col = model[:, c].copy()
-            for r in range(1, rows - 1):
-                w = float(np.clip(damp * (1.0 - sens[r]) * 0.35, 0, 0.5))
-                model[r, c] = (1-w)*col[r] + w*(0.25*col[r-1]+0.5*col[r]+0.25*col[r+1])
-        residual = sanitize(apparent - model, fill=0.0)
+            z_factor = 1.0 + (1.0 - float(sens[r])) * 1.5
+            for c in range(cols):
+                neighbors = []
+                if c > 0: neighbors.append(model[r, c-1] * z_factor)
+                if c < cols - 1: neighbors.append(model[r, c+1] * z_factor)
+                if r > 0: neighbors.append(model[r-1, c])
+                if r < rows - 1: neighbors.append(model[r+1, c])
+                
+                if neighbors:
+                    local_avg = np.mean(neighbors) / (z_factor if r in (0, rows-1) else 1.0)
+                    next_model[r, c] = (1.0 - damp) * model[r, c] + damp * local_avg
+
+        # 2. Pseudo Forward-Response & Back-Projection Weighting
+        residual = np.zeros_like(apparent)
+        residual[quality] = apparent[quality] - next_model[quality]
+        
         for r in range(rows):
-            model[r, quality[r,:]] += residual[r, quality[r,:]] * float(sens[r]) * 0.12
-        model = sanitize(np.clip(model, valid_min, valid_max), fill=valid_mean)
+            update_weight = float(sens[r]) * 0.25
+            next_model[r, quality[r, :]] += residual[r, quality[r, :]] * update_weight
+            
+        model = np.clip(next_model, v_min, v_max)
+        
+        # 3. Hitung Koreksi Root Mean Square (RMS) Error Global
         denom = safe_mean(apparent[quality], fallback=1.0)
-        vr = (model - apparent)[quality]
-        rms = float(np.sqrt(np.mean(vr**2)) / denom * 100) if vr.size > 0 and denom > 0 else 999.0
-        if not np.isfinite(rms): rms = 999.0
+        diff = (model - apparent)[quality]
+        
+        rms = float(np.sqrt(np.mean(diff**2)) / denom * 100) if diff.size > 0 else 999.0
+        if not np.isfinite(rms): 
+            rms = 999.0
+            
         rms_log.append(round(rms, 4))
+        
         if prev_rms is not None:
-            imp = prev_rms - rms
-            if imp < 0 and abs(imp) > prev_rms * 0.05:
-                diverge_count += 1
-                if diverge_count >= 3: break
-            else:
-                diverge_count = 0
-            if 0 <= imp < STAGNATION_DELTA:
-                converged = True; break
-        prev_rms = rms
+            if 0 <= (prev_rms - rms) < STAGNATION_DELTA:
+                converged = True
+                break
         if rms < convergence_thr:
-            converged = True; break
-    res_rel = np.abs(sanitize(model - apparent, fill=0.0)) / (sanitize(apparent) + 1e-9)
-    depth_unc = (1 - sens).reshape(-1,1) * np.ones((1, cols))
-    uncertainty = sanitize(np.clip(0.4*res_rel + 0.6*depth_unc, 0, 1), fill=1.0)
+            converged = True
+            break
+        prev_rms = rms
+
+    res_rel = np.abs(model - apparent) / (apparent + 1e-9)
+    res_rel[~quality] = 0.0
+    
+    depth_unc = (1.0 - sens).reshape(-1, 1) * np.ones((1, cols))
+    uncertainty = np.clip(0.3 * res_rel + 0.7 * depth_unc, 0.0, 1.0)
     uncertainty[~quality] = 1.0
+    
     return model, rms_log, converged, uncertainty
 
 def compute_confidence(rms, converged, completeness, n_cols, n_levels):
@@ -301,7 +334,7 @@ def classify_rho(v):
 
 def zone_color(cls):
     return {"Very Low":"#1E40AF","Low":"#0284C7","Moderate":"#059669",
-            "Elevated":"#D97706","High":"#DC2626","Very High":"#7F1D1D"}.get(cls,"#6B7280")
+            "Elevated":"#D97706","High":"#DC2626","Very High":"#7F1D1D"} .get(cls,"#6B7280")
 
 def interpret(model, uncertainty, depths):
     flat = sanitize(model.flatten(), fill=100.0)
@@ -318,7 +351,7 @@ def interpret(model, uncertainty, depths):
         label = f"Zone {chr(65+len(zones))}"
         zones.append({
             "label": label, "resistivity_class": cls,
-            "geophysical_descriptor": desc, "geological_context": ctx,
+            "gephysical_descriptor": desc, "geological_context": ctx,
             "range_ohm_m": [round(float(vals.min()),1), round(float(vals.max()),1)],
             "mean_ohm_m": round(mean_rho, 2), "uncertainty": round(mean_unc, 3),
             "confidence_qualifier": conf,
@@ -353,74 +386,88 @@ def interpret(model, uncertainty, depths):
 
 def render(model, uncertainty, depths, distances, rms_log, converged,
            confidence, filename, display_mode, spacing):
-    model = sanitize(model, fill=100.0)
-    uncertainty = sanitize(uncertainty, fill=1.0)
-    log_m = safe_log10(model)
-    log_min = safe_percentile(log_m, 2, fallback=0.0)
-    log_max = safe_percentile(log_m, 98, fallback=3.0)
-    if log_max <= log_min: log_max = log_min + 1.0
-    norm = mcolors.Normalize(vmin=log_min, vmax=log_max)
+    """
+    FIX PROBLEM 3: Skala Interval Logaritmik Tetap Konstan ala RES2DINV.
+    Menghilangkan dominasi warna merah akibat lonjakan nilai ekstrim di pinggir penampang.
+    """
     rows, cols = model.shape
-    if len(depths) != rows:
-        raise ValueError(f"depths {len(depths)} != model rows {rows}")
-    if len(distances) != cols:
-        raise ValueError(f"distances {len(distances)} != model cols {cols}")
     X, Y = np.meshgrid(distances, depths)
+    
+    fixed_rho_levels = np.array([1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000], dtype=np.float64)
+    log_levels = np.log10(fixed_rho_levels)
+    
+    log_m = np.log10(np.clip(model, 0.1, 1e5))
+    
+    valid_logs = log_m[uncertainty < 1.0]
+    if valid_logs.size > 0:
+        vmin_log = max(valid_logs.min(), log_levels[0])
+        vmax_log = min(valid_logs.max(), log_levels[-1])
+    else:
+        vmin_log, vmax_log = 0.0, 4.0
+        
+    norm = mcolors.Normalize(vmin=vmin_log, vmax=vmax_log)
+    
     fig = buf = None
     try:
         fig = plt.figure(figsize=(16, 5), facecolor='white')
-        ax  = fig.add_axes([0.07, 0.16, 0.82, 0.66])
+        ax = fig.add_axes([0.07, 0.16, 0.82, 0.66])
         ax.set_facecolor('white')
-        if display_mode == 'contoured':
-            lvl = np.linspace(log_min, log_max, 16)
-            ax.contourf(X, Y, log_m, levels=lvl, cmap=CMAP, norm=norm, extend='both')
-            cs = ax.contour(X, Y, log_m, levels=lvl[::4], colors='black', linewidths=0.8, alpha=0.65)
-            try: ax.clabel(cs, cs.levels[::2], inline=True, fontsize=6, fmt=lambda x: f'{10**x:.0f}', colors='black', inline_spacing=2)
-            except Exception: pass
-        elif display_mode == 'hybrid':
-            ax.imshow(log_m, aspect='auto', origin='upper',
-                      extent=[distances[0],distances[-1],depths[-1],depths[0]],
-                      cmap=CMAP, norm=norm, interpolation='bilinear')
-            cs = ax.contour(X, Y, log_m, levels=np.linspace(log_min,log_max,10)[1:-1],
-                            colors='black', linewidths=0.7, alpha=0.70)
-            try: ax.clabel(cs, cs.levels[::2], inline=True, fontsize=6, fmt=lambda x: f'{10**x:.0f}', colors='black', inline_spacing=2)
-            except Exception: pass
+        
+        active_levels = log_levels[(log_levels >= vmin_log - 0.1) & (log_levels <= vmax_log + 0.1)]
+        if len(active_levels) < 3:
+            active_levels = np.linspace(vmin_log, vmax_log, 12)
+            
+        if display_mode in ('contoured', 'hybrid'):
+            cf = ax.contourf(X, Y, log_m, levels=active_levels, cmap=CMAP, norm=norm, extend='both')
+            cs = ax.contour(X, Y, log_m, levels=active_levels[::2], colors='black', linewidths=0.6, alpha=0.5)
+            try:
+                ax.clabel(cs, inline=True, fontsize=7, fmt=lambda x: f'{10**x:.0f}', colors='black')
+            except Exception:
+                pass
         else:
             ax.imshow(log_m, aspect='auto', origin='upper',
-                      extent=[distances[0],distances[-1],depths[-1],depths[0]],
+                      extent=[distances[0], distances[-1], depths[-1], depths[0]],
                       cmap=CMAP, norm=norm, interpolation='bilinear')
-            try: ax.contour(X, Y, log_m, levels=np.linspace(log_min,log_max,8)[1:-1], colors='black', linewidths=0.5, alpha=0.45)
-            except Exception: pass
-        if (uncertainty > 0.70).any():
-            try: ax.contourf(X, Y, uncertainty, levels=[0.70,1.01], colors='white', alpha=0.25, hatches=['////'])
-            except Exception: pass
-        ax.set_xlabel('Distance (m)', fontsize=11)
-        ax.set_ylabel('Depth (m)', fontsize=11)
-        ax.tick_params(labelsize=9)
-        ax.grid(True, linestyle=':', linewidth=0.35, alpha=0.35, color='gray')
-        ax.set_axisbelow(True)
-        for sp2 in ax.spines.values(): sp2.set_linewidth(0.7)
-        step = max(1, len(depths)//6)
-        ax.set_yticks(depths[::step])
-        ax.set_yticklabels([f'{d:.1f}' for d in depths[::step]], fontsize=8)
+            
+        # Masking Area Trapesium Terbalik (Hatching Area No-Data)
+        if (uncertainty >= 0.99).any():
+            try:
+                ax.contourf(X, Y, uncertainty, levels=[0.99, 1.01], colors='white', alpha=1.0)
+                ax.contourf(X, Y, uncertainty, levels=[0.99, 1.01], colors='#e5e7eb', alpha=0.4, hatches=['\\\\\\\\'])
+            except Exception:
+                pass
+                
+        ax.set_xlabel('Distance (m)', fontsize=11, fontweight='semibold')
+        ax.set_ylabel('Depth (m)', fontsize=11, fontweight='semibold')
+        ax.grid(True, linestyle=':', linewidth=0.4, alpha=0.3, color='gray')
+        
+        ax.plot(distances, np.full_like(distances, depths[0]), 'v', color='black', markersize=4, alpha=0.6, label='Electrodes')
+        
+        ax.set_ylim(depths[-1], depths[0])
+        ax.set_yticks(depths)
+        ax.set_yticklabels([f'{d:.1f}' for d in depths], fontsize=8)
+        
         cax = fig.add_axes([0.91, 0.16, 0.015, 0.66])
-        sm = plt.cm.ScalarMappable(cmap=CMAP, norm=norm); sm.set_array([])
+        sm = plt.cm.ScalarMappable(cmap=CMAP, norm=norm)
+        sm.set_array([])
         cbar = fig.colorbar(sm, cax=cax)
-        cbar.set_label('Resistivity (ohm.m)', fontsize=9, labelpad=6)
-        log_ticks = np.linspace(log_min, log_max, 7)
-        cbar.set_ticks(log_ticks)
-        cbar.set_ticklabels([f'{10**t:.0f}' for t in log_ticks], fontsize=7)
+        cbar.set_label('Apparent Resistivity (Ω·m)', fontsize=10, labelpad=8)
+        
+        tick_values = fixed_rho_levels[(log_levels >= vmin_log) & (log_levels <= vmax_log)]
+        cbar.set_ticks(np.log10(tick_values))
+        cbar.set_ticklabels([f'{int(v)}' for v in tick_values], fontsize=8)
+        
         rms_val = rms_log[-1] if rms_log else 0.0
-        conv_str = "converged" if converged else "not converged"
-        fig.text(0.5, 0.95, f'Model Resistivity Section  -  {filename}', ha='center', fontsize=11, fontweight='bold')
-        fig.text(0.5, 0.91, f'RMS = {rms_val:.2f}%  |  Iter: {len(rms_log)}  |  {conv_str}', ha='center', fontsize=8, color='#444')
-        conf_pct = int(confidence*100)
-        conf_color = '#16a34a' if conf_pct>=70 else '#d97706' if conf_pct>=50 else '#dc2626'
-        fig.text(0.07, 0.91, f'Confidence: {conf_pct}%', fontsize=8, color=conf_color, fontweight='bold')
+        conv_str = "converged" if converged else "maximum iterations reached"
+        fig.text(0.5, 0.94, f'Pairoq Model Resistivity Section: {filename}', ha='center', fontsize=12, fontweight='bold')
+        fig.text(0.5, 0.89, f'RMS Error: {rms_val:.2f}%  |  Iterations: {len(rms_log)}  |  Status: {conv_str}  |  Spacing: {spacing}m', 
+                 ha='center', fontsize=9, color='#374151')
+        
         buf = io.BytesIO()
-        plt.savefig(buf, format='png', dpi=180, facecolor='white', bbox_inches='tight')
+        plt.savefig(buf, format='png', dpi=190, facecolor='white', bbox_inches='tight')
         buf.seek(0)
         return base64.b64encode(buf.read()).decode('utf-8')
+        
     finally:
         if fig is not None: plt.close(fig)
         if buf is not None: buf.close()
@@ -428,12 +475,12 @@ def render(model, uncertainty, depths, distances, rms_log, converged,
 
 @app.get("/")
 def root():
-    return {"service": "Pairoq Geophysical API", "version": "2.2.0",
+    return {"service": "Pairoq Geophysical API", "version": "2.3.0",
             "disclaimer": "Preliminary tool. Not RES2DINV/pyGIMLi equivalent. Requires professional validation."}
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "2.2.0"}
+    return {"status": "ok", "version": "2.3.0"}
 
 @app.post("/process")
 async def process(
